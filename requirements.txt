@@ -1,0 +1,18 @@
+# LangChain RAG sales-rep (LangGraph workflow)
+langchain
+langchain-core
+langchain-community
+langchain-text-splitters
+langgraph
+
+# Ollama (LLM + optional embeddings). Prefer community for base_url.
+# langchain-ollama  # optional; use if you want Ollama embeddings and newer API
+
+# Embeddings: sentence-transformers (local, no API key)
+sentence-transformers
+
+# Search (no API key)
+ddgs
+
+# Vector store: in-memory is built-in; chroma optional for persistence
+# chromadb>=0.4.0
