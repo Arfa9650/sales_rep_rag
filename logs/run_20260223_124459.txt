@@ -1,0 +1,108 @@
+2026-02-23 12:44:59,592 [INFO] sales_rep.agent: === RUN START === prospect=Antonx Private Limited  industry=Software solutions  max_steps=5
+2026-02-23 12:44:59,593 [INFO] sales_rep.agent: === INITIAL SEARCH === query=Antonx Private Limited Software solutions
+2026-02-23 12:44:59,593 [INFO] sales_rep.rag: RAG search: query=Antonx Private Limited Software solutions max_results=5
+2026-02-23 12:44:59,694 [WARNING] primp.impersonate: Impersonate 'chrome_104' does not exist, using 'random'
+2026-02-23 12:45:01,833 [INFO] sales_rep.rag: RAG search: got 5 raw results -> 5 docs for vector store
+2026-02-23 12:45:01,834 [INFO] sales_rep.agent: Initial search: 5 docs added to RAG index
+2026-02-23 12:45:01,834 [INFO] sales_rep.rag: RAG build_documents: my_company=1 prospect=1 search=5 -> total=7
+2026-02-23 12:45:01,834 [INFO] sales_rep.agent: === RAG INDEX === source docs=7
+2026-02-23 12:45:01,835 [INFO] sales_rep.agent: After chunking: 7 chunks stored in vector DB
+2026-02-23 12:45:01,858 [INFO] sentence_transformers.SentenceTransformer: Load pretrained SentenceTransformer: all-MiniLM-L6-v2
+2026-02-23 12:45:05,072 [WARNING] huggingface_hub.utils._http: Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+2026-02-23 12:45:06,453 [INFO] sales_rep.agent: === GRAPH STREAM START ===
+2026-02-23 12:45:06,455 [INFO] sales_rep.agent: ========== STEP 1 / 5 ==========
+2026-02-23 12:45:06,455 [INFO] sales_rep.agent: === REASON NODE ===
+2026-02-23 12:45:06,462 [DEBUG] langchain_core.vectorstores.utils: Unable to import simsimd, defaulting to NumPy implementation. If you want to use simsimd please install with `pip install simsimd`.
+2026-02-23 12:45:06,464 [INFO] sales_rep.agent: === VECTOR DB FETCH === chunks=7
+2026-02-23 12:45:06,464 [INFO] sales_rep.agent:   query: Value hypothesis messaging angle evidence: Company: Antonx Private Limited, Industry: Software solutions.
+2026-02-23 12:45:06,464 [INFO] sales_rep.agent:   [chunk 1] source=prospect_profile len=72
+2026-02-23 12:45:06,464 [INFO] sales_rep.agent:   [chunk 1] content:
+Company: Antonx Private Limited, Industry: Software solutions
+antonx.com
+2026-02-23 12:45:06,464 [INFO] sales_rep.agent:   [chunk 2] source=search          len=181
+2026-02-23 12:45:06,464 [INFO] sales_rep.agent:   [chunk 2] content:
+AntonX hiring for DevOps Intern
+AntonX (Private) Limited is a growing technology company committed to delivering cutting-edge software solutions and digital transformation services.
+2026-02-23 12:45:06,464 [INFO] sales_rep.agent:   [chunk 3] source=search          len=185
+2026-02-23 12:45:06,464 [INFO] sales_rep.agent:   [chunk 3] content:
+AntonX | Peshawar - Facebook
+Based in Peshawar, AntonX is a leading Product Design and Development Agency crafting innovative software solutions. If you're passionate about building ...
+2026-02-23 12:45:06,464 [INFO] sales_rep.agent:   [chunk 4] source=search          len=211
+2026-02-23 12:45:06,464 [INFO] sales_rep.agent:   [chunk 4] content:
+AntonX (@myantonx) • Instagram photos and videos
+We're Hiring! Software Project Manager at AntonX We're looking for someone who can manage projects, document requirements, lead Agile processes, and work well ...
+2026-02-23 12:45:06,464 [INFO] sales_rep.agent:   [chunk 5] source=search          len=197
+2026-02-23 12:45:06,464 [INFO] sales_rep.agent:   [chunk 5] content:
+AntonX | Peshawar - Facebook
+Rating 5.0 (1) AntonX, Peshawar. 2167 likes · 2 talking about this · 6 were here. AntonX is a software development company on a mission to make human-friendly software.
+2026-02-23 12:45:06,464 [INFO] sales_rep.agent:   [chunk 6] source=my_company      len=137
+2026-02-23 12:45:06,464 [INFO] sales_rep.agent:   [chunk 6] content:
+K2X Technologies: We provide AI-driven software solutions for industrial companies to improve operational efficiency and reduce downtime.
+2026-02-23 12:45:06,464 [INFO] sales_rep.agent:   [chunk 7] source=search          len=215
+2026-02-23 12:45:06,464 [INFO] sales_rep.agent:   [chunk 7] content:
+#careers #devops #softwaredev #peshawar #internship | AntonX
+15-Sept-2025 · Paid Internship Opportunity – DevOps Intern at AntonX (Private) Limited AntonX is looking for a DevOps Intern to join our team in Peshawar.
+2026-02-23 12:45:06,464 [INFO] sales_rep.agent: [Reason] prompt  len=2570
+2026-02-23 12:45:06,464 [INFO] sales_rep.agent: [Reason] PROMPT:
+Task:
+You are a sales rep assistant.
+
+Who you represent (your company / who you are selling for):
+K2X Technologies: We provide AI-driven software solutions for industrial companies to improve operational efficiency and reduce downtime.
+
+Prospect (the company you are exploring or contacting):
+Company: Antonx Private Limited
+Industry: Software solutions
+Public website or profile text:
+antonx.com
+
+Your goal: Propose (1) a value hypothesis, (2) a suggested messaging angle, (3) supporting evidence or assumptions.
+You MUST use tools when information is thin: use search_web to look up the company and industry, and extract_insights on the profile.
+Do NOT stop with "insufficient information" — iterate: search, then synthesise.
+Only stop when you have enough to write concrete VALUE HYPOTHESIS, MESSAGING ANGLE, and SUPPORTING EVIDENCE.
+
+When you stop, your final answer MUST use these exact headers:
+VALUE HYPOTHESIS: <your value hypothesis>
+MESSAGING ANGLE: <your suggested messaging angle>
+SUPPORTING EVIDENCE: <supporting evidence or assumptions>
+
+Memory (prior findings):
+(no memory yet)
+
+Recent turns:
+(no turns yet)
+
+Relevant context retrieved from knowledge base:
+Company: Antonx Private Limited, Industry: Software solutions
+antonx.com
+
+---
+
+AntonX hiring for DevOps Intern
+AntonX (Private) Limited is a growing technology company committed to delivering cutting-edge software solutions and digital transformation services.
+
+---
+
+AntonX | Peshawar - Facebook
+Based in Peshawar, AntonX is a leading Product Design and Development Agency crafting innovative software solutions. If you're passionate about building ...
+
+---
+
+AntonX (@myantonx) • Instagram photos and videos
+We're Hiring! Software Project Manager at AntonX We're looking for someone who can manage projects, document requirements, lead Agile processes, and work well ...
+
+---
+
+AntonX | Peshawar - Facebook
+Rating 5.0 (1) AntonX, Peshawar. 2167 likes · 2 talking about this · 6 were here. AntonX is a software development company on a mission to make human-friendly software.
+
+---
+
+K2X Technologies: We provide AI-driven software solutions for industrial companies to improve operational efficiency and reduce downtime.
+
+---
+
+#careers #devops #softwaredev #peshawar #internship | AntonX
+15-Sept-2025 · Paid Internship Opportunity – DevOps Intern at AntonX (Private) Limited AntonX is looking for a DevOps Intern to join our team in Peshawar.
+
+Briefly state: what do you know so far and what is still missing to write a VALUE HYPOTHESIS, MESSAGING ANGLE, and SUPPORTING EVIDENCE? One short paragraph.

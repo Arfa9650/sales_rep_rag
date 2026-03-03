@@ -112,13 +112,22 @@ def parse_decision(raw: str, structured_fallback: Optional[Dict] = None) -> Deci
 def parse_reflection(raw: str) -> Dict[str, Any]:
     """
     Parse reflection output: returns dict with confidence, should_revise, critique.
-    Falls back to heuristic scanning when no JSON is found.
+
+    Handles three formats (in priority order):
+    1. JSON object
+    2. Structured fill-in-the-blank (the preferred Reflect prompt format):
+         Confidence I can write all three sections right now (0.0-1.0): 0.7
+         Should I keep searching (yes/no): no
+    3. Heuristic keyword scanning (fallback)
     """
     result: Dict[str, Any] = {
         "confidence": 0.5,
         "should_revise": False,
         "critique": (raw or "")[:500],
     }
+    lower = (raw or "").lower()
+
+    # --- 1. Try JSON ---
     obj = _extract_json_obj(raw or "")
     if obj:
         try:
@@ -131,18 +140,37 @@ def parse_reflection(raw: str) -> Dict[str, Any]:
             result["critique"] = str(obj["critique"])
         return result
 
-    # Heuristic: scan for confidence value
-    m = re.search(r"confidence[:\s]+([01](?:\.[0-9]+)?|0\.[0-9]+)", raw or "", re.IGNORECASE)
-    if m:
+    # --- 2. Structured fill-in-the-blank ---
+    # "Confidence I can write all three sections right now (0.0-1.0): 0.7"
+    m_conf = re.search(
+        r"confidence[^:\n]{0,60}:\s*([01](?:\.[0-9]+)?)",
+        raw or "",
+        re.IGNORECASE,
+    )
+    if m_conf:
         try:
-            result["confidence"] = float(m.group(1))
+            result["confidence"] = float(m_conf.group(1))
         except ValueError:
             pass
 
-    # Heuristic: should_revise
-    revise_signals = ("revise", "continue", "need more", "need additional", "insufficient", "not enough", "more info")
-    stop_signals = ("sufficient", "ready to answer", "high confidence", "should stop", "can stop")
-    lower = (raw or "").lower()
+    # "Should I keep searching (yes/no): yes|no"
+    m_search = re.search(
+        r"keep searching[^:\n]{0,20}:\s*(yes|no)",
+        lower,
+    )
+    if m_search:
+        result["should_revise"] = m_search.group(1).strip() == "yes"
+        return result
+
+    # --- 3. Keyword heuristics (last resort) ---
+    revise_signals = (
+        "keep searching", "revise", "continue", "need more", "need additional",
+        "insufficient", "not enough", "more info", "missing",
+    )
+    stop_signals = (
+        "sufficient", "ready to answer", "high confidence", "should stop",
+        "can stop", "no more searching",
+    )
     if any(s in lower for s in revise_signals):
         result["should_revise"] = True
     if any(s in lower for s in stop_signals):

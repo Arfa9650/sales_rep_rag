@@ -8,7 +8,7 @@ import os
 MAX_STEPS = 15
 MEMORY_RECENT_K = 10
 # Only allow the agent to stop when confidence >= this (so it iterates with tools until satisfied)
-MIN_CONFIDENCE_TO_STOP = 0.6
+MIN_CONFIDENCE_TO_STOP = 0.8
 DECIDE_PARSE_RETRIES = 1
 MODEL_ERROR_RETRIES = 2
 
@@ -16,6 +16,11 @@ MODEL_ERROR_RETRIES = 2
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "deepseek-r1:8b")
 MODEL_NAME = OLLAMA_MODEL
+
+# OpenAI — used by the consult_oracle tool (higher-intelligence synthesis)
+# Paste your key in .env or set the environment variable before running.
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 # LangGraph
 ENABLE_CHECKPOINTING = bool(os.getenv("ENABLE_CHECKPOINTING", ""))  # set to "1" to enable MemorySaver
@@ -34,3 +39,6 @@ VECTOR_STORE_PATH = os.getenv("VECTOR_STORE_PATH", "./chroma_sales_rep")
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "800"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "150"))
 RETRIEVER_TOP_K = int(os.getenv("RETRIEVER_TOP_K", "8"))
+
+# API (FastAPI)
+API_CORS_ORIGINS = os.getenv("API_CORS_ORIGINS", "")  # e.g. "http://localhost:3000,http://127.0.0.1:3000"

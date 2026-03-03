@@ -12,10 +12,10 @@ if __name__ == "__main__":
         "K2X Technologies: We provide AI-driven software solutions for industrial companies "
         "to improve operational efficiency and reduce downtime."
     )
-    PROSPECT_COMPANY = "Antonx Private Limited"
-    PROSPECT_INDUSTRY = "Software solutions"
+    PROSPECT_COMPANY = "Zones inc islamabd, pakistan"
+    PROSPECT_INDUSTRY = "IT service management company"
     PROSPECT_PROFILE = (
-        "antonx.com"
+        "zones.com"
     )
 
     out = run_sales_rep_flow(

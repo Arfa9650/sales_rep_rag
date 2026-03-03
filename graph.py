@@ -8,21 +8,23 @@ Graph topology:
                                                           |
                                                    generate_answer → END
 
-Each node receives AgentState; non-serialisable runtime objects (retriever,
-vector_store, tool_registry) are injected via config["configurable"].
+Prompt design principles for small local models (qwen/deepseek 8b):
+  - reason_node  : gap-analysis only; "Do NOT write a VALUE HYPOTHESIS yet"
+  - decide_node  : no RAG re-retrieval; tracks tools_used; consult_oracle trigger
+  - reflect_node : structured fill-in-the-blank (no free-form JSON expected)
+  - generate_answer : clean, tool-instruction-free prompt; [ASSUMPTION] labelling
+  RAG retrieval only in reason_node and generate_answer_node (saves context budget).
 """
 
 import logging
 import re
-from typing import Any, Dict, List, Literal, Optional, Tuple, TypedDict
+from typing import Any, Dict, List, Literal, Optional, TypedDict
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 
 from config import (
     DECIDE_PARSE_RETRIES,
-    ENABLE_CHECKPOINTING,
-    GRAPH_RECURSION_LIMIT,
     MEMORY_RECENT_K,
     MIN_CONFIDENCE_TO_STOP,
     MODEL_ERROR_RETRIES,
@@ -34,42 +36,47 @@ import rag
 
 logger = logging.getLogger("sales_rep.agent")
 
+
 # ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
 
 class AgentState(TypedDict):
     # Immutable inputs (set once at start)
-    task: str
+    task: str               # full context document (seller + prospect + profile)
     retrieval_query: str
     max_steps: int
     tool_descriptions: str
+    # Short run-level metadata used by node prompts
+    my_company_summary: str   # one-liner: who the seller is
+    company_name: str         # prospect company
+    industry: str             # prospect industry
     # Accumulated across steps
     step: int
+    tools_used: List[str]               # tool_ids called so far (for dedup rules)
     memory_items: List[str]
     turn_history: List[Dict[str, Any]]
     # Per-step outputs (overwritten each step)
     reason_text: str
-    decision: Dict[str, Any]    # serialised Decision fields
+    decision: Dict[str, Any]
     tool_result: str
     tool_error: str
     observation: str
-    reflection: Dict[str, Any]  # {confidence, should_revise, critique}
+    reflection: Dict[str, Any]
     # Final answer (set by generate_answer node)
     final_response: str
 
 
 def _cfg(config: RunnableConfig, key: str, default: Any = None) -> Any:
-    """Safely pull a value from config["configurable"]."""
     return (config or {}).get("configurable", {}).get(key, default)
 
 
 # ---------------------------------------------------------------------------
-# Logging helpers (all logging for the graph lives here)
+# Logging helpers
 # ---------------------------------------------------------------------------
 
 def _log_prompt(tag: str, prompt: str) -> None:
-    logger.info("[%s] prompt  len=%d", tag, len(prompt))
+    logger.info("[%s] PROMPT  len=%d", tag, len(prompt))
     if len(prompt) <= 12_000:
         logger.info("[%s] PROMPT:\n%s", tag, prompt)
     else:
@@ -78,7 +85,7 @@ def _log_prompt(tag: str, prompt: str) -> None:
 
 
 def _log_response(tag: str, response: str) -> None:
-    logger.info("[%s] RESPONSE len=%d:\n%s", tag, len(response or ""), response or "")
+    logger.info("[%s] RESPONSE  len=%d:\n%s", tag, len(response or ""), response or "")
 
 
 def _log_retrieved(query: str, chunks: List[Any]) -> None:
@@ -87,7 +94,7 @@ def _log_retrieved(query: str, chunks: List[Any]) -> None:
     for i, c in enumerate(chunks):
         content = getattr(c, "page_content", str(c)) or ""
         meta = getattr(c, "metadata", {}) or {}
-        logger.info("  [chunk %d] source=%-15s len=%d", i + 1, meta.get("source", "?"), len(content))
+        logger.info("  [chunk %d] source=%-15s  len=%d", i + 1, meta.get("source", "?"), len(content))
         logger.info("  [chunk %d] content:\n%s", i + 1, content[:2_000] if len(content) > 2_000 else content)
     if not chunks:
         logger.info("  (no chunks returned)")
@@ -101,7 +108,6 @@ _INSUFFICIENT_PHRASES = ("insufficient", "need more", "need additional", "lack "
 
 
 def _call_model(prompt: str, step_name: str) -> str:
-    """Call Ollama with retries."""
     last_err: Optional[Exception] = None
     for attempt in range(MODEL_ERROR_RETRIES + 1):
         try:
@@ -120,32 +126,22 @@ def _format_retrieved(chunks: List[Any]) -> str:
     return "\n\n---\n\n".join(getattr(c, "page_content", str(c)) for c in chunks)
 
 
-def _build_context(state: AgentState, retriever: Optional[Any] = None) -> str:
-    """Assemble context string: task + memory + recent turns + optional RAG chunks."""
-    history_str = "\n".join(
-        f"Turn {i + 1}: {t.get('action', '')} -> {t.get('observation', '')[:300]}"
-        for i, t in enumerate((state.get("turn_history") or [])[-MEMORY_RECENT_K:])
-    ) or "(no turns yet)"
-
-    memory_str = "\n".join(state.get("memory_items") or []) or "(no memory yet)"
-
-    context = (
-        f"Task:\n{state['task']}\n\n"
-        f"Memory (prior findings):\n{memory_str}\n\n"
-        f"Recent turns:\n{history_str}"
+def _retrieve(state: AgentState, retriever: Any, tag: str) -> str:
+    """Run retriever and log results. Returns formatted string."""
+    if not retriever:
+        return ""
+    query = (
+        state.get("retrieval_query")
+        or f"{state.get('company_name', '')} {state.get('industry', '')}".strip()
+        or state["task"][:300]
     )
-
-    if retriever:
-        query = state.get("retrieval_query") or state["task"][:500]
-        try:
-            chunks = retriever.invoke(query)
-            _log_retrieved(query, chunks)
-            if chunks:
-                context += f"\n\nRelevant context retrieved from knowledge base:\n{_format_retrieved(chunks)}"
-        except Exception as exc:
-            logger.warning("Retrieval failed: %s", exc)
-
-    return context
+    try:
+        chunks = retriever.invoke(query)
+        _log_retrieved(query, chunks)
+        return _format_retrieved(chunks) if chunks else ""
+    except Exception as exc:
+        logger.warning("Retrieval failed [%s]: %s", tag, exc)
+        return ""
 
 
 def _decision_from_dict(d: Dict[str, Any]) -> Decision:
@@ -178,19 +174,40 @@ def _decision_to_dict(dec: Decision) -> Dict[str, Any]:
 
 def reason_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     """
-    Step 1 – Reason: what do we know, what is still missing?
-    Increments the step counter and injects fresh RAG chunks into context.
+    Step 1 – Reason: gap analysis only.
+    RAG retrieval happens HERE (and in generate_answer). Not in decide/reflect.
     """
     retriever = _cfg(config, "retriever")
     new_step = state["step"] + 1
     logger.info("========== STEP %d / %d ==========", new_step, state["max_steps"])
     logger.info("=== REASON NODE ===")
 
-    context = _build_context(state, retriever=retriever)
+    retrieved_str = _retrieve(state, retriever, "reason")
+
+    memory_str = "\n".join(state.get("memory_items") or []) or "(no prior findings yet)"
+    history_str = (
+        "\n".join(
+            f"Turn {i + 1}: {t.get('action', '')} -> {t.get('observation', '')[:250]}"
+            for i, t in enumerate((state.get("turn_history") or [])[-MEMORY_RECENT_K:])
+        )
+        or "(none)"
+    )
+    tools_used_str = ", ".join(state.get("tools_used") or []) or "none yet"
+
     prompt = (
-        f"{context}\n\n"
-        "Briefly state: what do you know so far and what is still missing to write a "
-        "VALUE HYPOTHESIS, MESSAGING ANGLE, and SUPPORTING EVIDENCE? One short paragraph."
+        f"Seller: {state.get('my_company_summary', 'N/A')}\n"
+        f"Prospect: {state.get('company_name', 'N/A')} | {state.get('industry', 'N/A')}\n\n"
+        f"Prior findings:\n{memory_str}\n\n"
+        f"Recent turns:\n{history_str}\n\n"
+        + (f"Knowledge base context:\n{retrieved_str}\n\n" if retrieved_str else "")
+        + f"Tools used so far this run: [{tools_used_str}]\n\n"
+        "Your task: Analyse the situation in ONE short paragraph.\n"
+        "1. What specific facts do you have about the prospect?\n"
+        "2. What is still unknown or unclear?\n"
+        "3. What is the single best next step (search, extract, oracle synthesis, or stop)?\n\n"
+        "If you are unsure what to search for or how to proceed, you may (optionally) call "
+        "consult_oracle to get suggested search queries or next steps.\n\n"
+        "IMPORTANT: Do NOT write a VALUE HYPOTHESIS, MESSAGING ANGLE, or SUPPORTING EVIDENCE yet."
     )
     _log_prompt("Reason", prompt)
     try:
@@ -206,27 +223,79 @@ def reason_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
 
 def decide_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     """
-    Step 2 – Decide: what action to take next (tool call or stop).
-    Retries up to DECIDE_PARSE_RETRIES times if the JSON cannot be parsed.
+    Step 2 – Decide: choose the next action.
+    No RAG re-retrieval here (saves token budget). Tracks tools_used for dedup rules.
+    consult_oracle is optional (at end for synthesis, or when stuck for search ideas).
     """
-    retriever = _cfg(config, "retriever")
     logger.info("=== DECIDE NODE ===")
-    context = _build_context(state, retriever=retriever)
+
+    memory_str = (
+        "\n".join((state.get("memory_items") or [])[-MEMORY_RECENT_K:])
+        or "(no prior findings)"
+    )
+    tools_used: List[str] = state.get("tools_used") or []
+    tools_used_str = ", ".join(tools_used) or "none yet"
+    search_count = sum(1 for t in tools_used if t == "search_web")
+    extract_count = sum(1 for t in tools_used if t == "extract_insights")
+    oracle_used = "consult_oracle" in tools_used
+
+    # Build adaptive rules block
+    rules: List[str] = [
+        f"Tools you have already called this run: [{tools_used_str}]",
+        "RULES:",
+    ]
+    if oracle_used:
+        rules.append(
+            "- consult_oracle was already called. You MUST set should_stop=true now. "
+            "The oracle synthesis is in your prior findings above — use it to generate the final answer."
+        )
+    elif search_count >= 1 and extract_count >= 1:
+        rules.append(
+            "- You have searched AND extracted insights. "
+            "You MAY call consult_oracle to get a sharper synthesis, OR if you are already confident "
+            "(e.g. confidence >= 0.7) you MAY set should_stop=true and skip the oracle."
+        )
+    elif search_count >= 2:
+        rules.append(
+            f"- You have done {search_count} web searches. "
+            "You MAY call consult_oracle to synthesise, OR set should_stop=true if you are "
+            "confident enough (optional oracle)."
+        )
+    elif search_count == 1:
+        rules.append(
+            "- You have done 1 web search. "
+            "You may call consult_oracle to synthesise, or do one more targeted search if a key "
+            "fact is still missing, or set should_stop=true if confident (optional oracle)."
+        )
+    else:
+        rules.append(
+            "- You have not searched yet. Call search_web with a specific query, "
+            "or extract_insights on the profile. "
+            "If you don't know what to search for: you MAY call consult_oracle with "
+            "question='What should I search for to learn about [prospect/industry]?' and "
+            "context=current task summary (optional). Do NOT stop yet."
+        )
+
+    if search_count > 0:
+        rules.append("- Do NOT repeat a search_web query you have already used.")
+    if extract_count > 0:
+        rules.append("- Do NOT call extract_insights again; you already have that result.")
+
+    rules_str = "\n".join(rules)
 
     base_prompt = (
-        f"{context}\n\n"
-        f"Your reasoning so far: {(state.get('reason_text') or '')[:600]}\n\n"
+        f"Seller: {state.get('my_company_summary', 'N/A')}\n"
+        f"Prospect: {state.get('company_name', 'N/A')} | {state.get('industry', 'N/A')}\n\n"
+        f"Your analysis this step:\n{(state.get('reason_text') or '')[:700]}\n\n"
+        f"Prior findings (memory):\n{memory_str}\n\n"
+        f"{rules_str}\n\n"
         f"Available tools:\n{state['tool_descriptions']}\n\n"
-        "Decide: What should I do next?\n"
-        "- If you lack company/industry details: set should_stop=false and call a tool.\n"
-        "  Use search_web with a concrete query, or extract_insights on the profile.\n"
-        "- Only set should_stop=true when you have enough for VALUE HYPOTHESIS, MESSAGING ANGLE, "
-        "and SUPPORTING EVIDENCE.\n"
-        "- Do NOT stop with 'insufficient information' — search first, then synthesise.\n\n"
-        "Respond with a JSON object with exactly these keys:\n"
-        "  next_action (string), tool_id (string or null), tool_input (object, e.g. {\"query\": \"...\"}),\n"
-        "  confidence (0.0-1.0), should_stop (bool), should_revise (bool), reasoning (string)"
+        "Respond with a JSON object — keys MUST be exactly:\n"
+        "  next_action (string), tool_id (string or null), tool_input (object),\n"
+        "  confidence (0.0-1.0), should_stop (bool), should_revise (bool), reasoning (string)\n\n"
+        "JSON only — no other text."
     )
+
     prompt = base_prompt
     last_error: Optional[Exception] = None
 
@@ -253,25 +322,23 @@ def decide_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
             logger.warning("parse_decision attempt %d failed: %s", attempt + 1, exc)
             if attempt < DECIDE_PARSE_RETRIES:
                 prompt = (
-                    "Your previous response was invalid. Respond ONLY with a JSON object "
-                    "containing: next_action, tool_id, tool_input (object), confidence (0-1), "
+                    "Your previous response was invalid. Respond ONLY with a valid JSON object "
+                    "containing exactly: next_action, tool_id, tool_input (object), confidence (0-1), "
                     "should_stop (bool), should_revise (bool), reasoning (string)."
                 )
 
     logger.error("Decide node exhausted retries: %s", last_error)
-    # Return a safe fallback decision so the graph can continue
     return {
-        "decision": _decision_to_dict(Decision(
-            next_action="continue",
-            reasoning=f"Decide failed: {last_error}",
-        ))
+        "decision": _decision_to_dict(
+            Decision(next_action="continue", reasoning=f"Decide failed: {last_error}")
+        )
     }
 
 
 def act_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     """
     Step 3 – Act: run the chosen tool (if any).
-    When search_web is used, search results are also added to the vector store.
+    search_web results are also embedded into the vector store for future retrieval.
     """
     tool_registry = _cfg(config, "tool_registry") or {}
     vector_store = _cfg(config, "vector_store")
@@ -285,16 +352,22 @@ def act_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     logger.info("=== TOOL CALL === tool_id=%s  tool_input=%s", decision.tool_id, decision.tool_input)
     if decision.tool_id == "search_web":
         logger.info("=== SEARCH RUNNING === query=%s", decision.tool_input.get("query", ""))
+    elif decision.tool_id == "consult_oracle":
+        logger.info("=== ORACLE CONSULTING === question=%s", decision.tool_input.get("question", "")[:200])
 
     try:
         result = run_tool(tool_registry, decision.tool_id, decision.tool_input)
         result_str = str(result)
-        logger.info("=== TOOL RESULT (%s) === (first 1500 chars)\n%s", decision.tool_id, result_str[:1_500])
+        logger.info(
+            "=== TOOL RESULT (%s) === (first 1500 chars)\n%s",
+            decision.tool_id,
+            result_str[:1_500],
+        )
     except Exception as exc:
         logger.warning("Tool error (%s): %s", decision.tool_id, exc)
         return {"tool_result": "", "tool_error": str(exc)}
 
-    # After search_web: add results to vector store for future retrieval
+    # Embed search results into vector store so future reason/generate nodes can retrieve them
     if decision.tool_id == "search_web" and decision.tool_input.get("query") and vector_store is not None:
         q = decision.tool_input["query"]
         max_r = decision.tool_input.get("max_results", 5)
@@ -309,20 +382,24 @@ def act_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
                     "  [doc %d] source=%s  url=%s  len=%d",
                     j + 1, meta.get("source"), meta.get("url", ""), len(content),
                 )
-                logger.info("  [doc %d] content:\n%s", j + 1, content[:1_200] if len(content) > 1_200 else content)
+                logger.info(
+                    "  [doc %d] content:\n%s",
+                    j + 1,
+                    content[:1_200] if len(content) > 1_200 else content,
+                )
             if extra_docs and hasattr(vector_store, "add_documents"):
                 vector_store.add_documents(extra_docs)
                 logger.info("  Vector store: added %d docs", len(extra_docs))
             else:
                 logger.info("  Vector store: add_documents unavailable or no docs to add")
         except Exception as exc:
-            logger.warning("  Failed to add search docs: %s", exc)
+            logger.warning("  Failed to add search docs to vector store: %s", exc)
 
     return {"tool_result": result_str, "tool_error": ""}
 
 
 def observe_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
-    """Step 4 – Observe: convert tool result/error into a human-readable observation."""
+    """Step 4 – Observe: convert tool result/error into a readable observation."""
     logger.info("=== OBSERVE NODE ===")
     decision = _decision_from_dict(state.get("decision") or {})
     tool_id = decision.tool_id or ""
@@ -332,7 +409,7 @@ def observe_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     if tool_error:
         obs = f"Tool {tool_id} failed: {tool_error}"
     elif tool_id:
-        obs = f"Tool {tool_id} result: {tool_result[:2_000]}"
+        obs = f"Tool {tool_id} result: {tool_result[:2_500]}"
     else:
         obs = "No tool was used this step."
 
@@ -341,7 +418,7 @@ def observe_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
 
 
 def update_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
-    """Step 5 – Update: append this step to memory and turn history."""
+    """Step 5 – Update: append step to memory/history and record tool used."""
     logger.info("=== UPDATE NODE ===")
     decision = _decision_from_dict(state.get("decision") or {})
     step = state["step"]
@@ -350,7 +427,7 @@ def update_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
 
     new_memory_item = (
         f"Step {step}: action={decision.next_action}  tool={tool_id}  "
-        f"observation: {observation[:250]}"
+        f"observation: {observation[:300]}"
     )
     new_turn = {
         "action": f"tool={tool_id}" if tool_id != "none" else decision.next_action,
@@ -358,30 +435,51 @@ def update_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     }
     logger.info("  Memory item: %s", new_memory_item[:200])
 
+    new_tools_used = list(state.get("tools_used") or [])
+    if tool_id != "none":
+        new_tools_used.append(tool_id)
+        logger.info("  Tools used (updated): %s", new_tools_used)
+
     return {
         "memory_items": list(state.get("memory_items") or []) + [new_memory_item],
         "turn_history": list(state.get("turn_history") or []) + [new_turn],
+        "tools_used": new_tools_used,
     }
 
 
 def reflect_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
-    """Step 6 – Reflect: self-critique; is the information sufficient to stop?"""
-    retriever = _cfg(config, "retriever")
+    """
+    Step 6 – Reflect: structured self-critique.
+    Uses fill-in-the-blank format (no free-form JSON) so small models can follow it reliably.
+    No RAG re-retrieval here.
+    """
     logger.info("=== REFLECT NODE ===")
-    context = _build_context(state, retriever=retriever)
     observation = state.get("observation") or ""
+    memory_str = (
+        "\n".join((state.get("memory_items") or [])[-MEMORY_RECENT_K:])
+        or "(none)"
+    )
     decision = _decision_from_dict(state.get("decision") or {})
+    tools_used_str = ", ".join(state.get("tools_used") or []) or "none"
+    oracle_used = "consult_oracle" in (state.get("tools_used") or [])
 
     prompt = (
-        f"{context}\n\n"
-        f"Last observation: {observation}\n\n"
-        "Evaluate the current state:\n"
-        "- What assumptions are you making?\n"
-        "- Is your information sufficient to write VALUE HYPOTHESIS, MESSAGING ANGLE, "
-        "and SUPPORTING EVIDENCE right now?\n"
-        "- Confidence score (0.0-1.0)?\n"
-        "- If not sufficient, recommend continuing with a tool (e.g. search_web).\n"
-        "- should_revise=true means keep looping; should_revise=false means ready to answer."
+        f"Prospect: {state.get('company_name', 'N/A')} | {state.get('industry', 'N/A')}\n"
+        f"Tools used this run: {tools_used_str}\n\n"
+        f"Latest finding:\n{observation[:1_000]}\n\n"
+        f"All findings so far:\n{memory_str}\n\n"
+        + (
+            "NOTE: consult_oracle has already been called. Do NOT suggest more searching.\n\n"
+            if oracle_used
+            else ""
+        )
+        + "Complete each line (be brief and specific):\n"
+        "Assumptions I am making: [one sentence]\n"
+        "Key facts confirmed about the prospect: [one sentence]\n"
+        "What is still missing: [one sentence, or write 'nothing critical']\n"
+        "Confidence I can write all three sections right now (0.0-1.0): [number only]\n"
+        "Should I keep searching (yes/no): [yes or no]\n"
+        "Reason: [one sentence]"
     )
     _log_prompt("Reflect", prompt)
     try:
@@ -403,44 +501,54 @@ def reflect_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
 
 def generate_answer_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     """
-    Final node: one dedicated LLM call that produces the three-section structured answer
-    grounded in all accumulated memory + one last retrieval pass.
+    Final node: dedicated LLM call for the structured three-section answer.
+    Prompt is clean (no tool instructions). [ASSUMPTION] labels unconfirmed claims.
     """
     retriever = _cfg(config, "retriever")
     logger.info("=== GENERATE ANSWER NODE ===")
 
-    # Last retrieval pass for fresh grounding
-    retrieved_str = ""
-    if retriever:
-        query = state.get("retrieval_query") or state["task"][:500]
-        try:
-            chunks = retriever.invoke(query)
-            _log_retrieved(query, chunks)
-            if chunks:
-                retrieved_str = _format_retrieved(chunks)
-        except Exception as exc:
-            logger.warning("Final retrieval failed: %s", exc)
-
+    retrieved_str = _retrieve(state, retriever, "generate_answer")
     memory_str = "\n".join(state.get("memory_items") or []) or "(no prior findings)"
 
+    # Check if oracle synthesis is in memory — surface it prominently
+    oracle_synthesis = ""
+    for item in reversed(state.get("memory_items") or []):
+        if "tool=consult_oracle" in item:
+            oracle_synthesis = item
+            break
+
+    oracle_section = (
+        f"\nOracle synthesis (use this as primary input):\n{oracle_synthesis}\n"
+        if oracle_synthesis
+        else ""
+    )
+
     prompt = (
-        f"Task:\n{state['task']}\n\n"
-        f"Prior findings (memory):\n{memory_str}\n\n"
-        + (f"Retrieved context (knowledge base):\n{retrieved_str}\n\n" if retrieved_str else "")
-        + "Using ONLY the information above, write your final answer with EXACTLY these headers "
-        "(no additional text before or after):\n"
-        "VALUE HYPOTHESIS: <one or two sentences>\n"
-        "MESSAGING ANGLE: <one or two sentences>\n"
-        "SUPPORTING EVIDENCE: <bullets or short paragraph>"
+        "You are writing a concise sales pitch brief.\n\n"
+        f"Seller: {state.get('my_company_summary', 'N/A')}\n"
+        f"Prospect: {state.get('company_name', 'N/A')} ({state.get('industry', 'N/A')})\n\n"
+        f"Research gathered:\n{memory_str}\n"
+        + oracle_section
+        + (f"\nSupporting context from knowledge base:\n{retrieved_str}\n" if retrieved_str else "")
+        + "\nInstructions:\n"
+        "- Use ONLY confirmed facts from the research above.\n"
+        "- Label any claim that is not directly evidenced as [ASSUMPTION].\n"
+        "- Be specific: name the prospect, name the seller's capability, say WHY it matters to them.\n"
+        "- Output ONLY the three sections below, nothing else.\n\n"
+        "VALUE HYPOTHESIS: [one or two sentences — specific value the seller delivers to THIS prospect]\n\n"
+        "MESSAGING ANGLE: [one sentence — the opening line of the pitch, tailored to the prospect]\n\n"
+        "SUPPORTING EVIDENCE:\n"
+        "- [fact or [ASSUMPTION]]\n"
+        "- [fact or [ASSUMPTION]]\n"
+        "- [fact or [ASSUMPTION]]"
     )
     _log_prompt("GenerateAnswer", prompt)
     try:
         final = _call_model(prompt, "generate_answer")
         _log_response("GenerateAnswer", final)
-        logger.info("=== FINAL ANSWER GENERATED ===\n%s", final[:600])
+        logger.info("=== FINAL ANSWER GENERATED ===\n%s", final[:800])
     except Exception as exc:
         logger.error("generate_answer_node failed: %s", exc)
-        # Fall back to last observation
         final = state.get("observation") or "Unable to generate answer."
 
     return {"final_response": final}
@@ -450,21 +558,17 @@ def generate_answer_node(state: AgentState, config: RunnableConfig) -> Dict[str,
 # Routing
 # ---------------------------------------------------------------------------
 
-def route_after_reflect(
-    state: AgentState,
-) -> Literal["reason", "generate_answer"]:
+def route_after_reflect(state: AgentState) -> Literal["reason", "generate_answer"]:
     """
     After Reflect, decide whether to loop back to Reason or produce the final answer.
-    Four cases:
-      1. should_revise → reason
-      2. max_steps reached → generate_answer
-      3. should_stop + confidence OK + not "insufficient without tool" → generate_answer
-      4. everything else → reason (continue iterating)
+    Oracle-used state always routes to generate_answer (oracle is the last tool).
     """
     decision = _decision_from_dict(state.get("decision") or {})
     reflection = state.get("reflection") or {}
     step = state["step"]
     max_steps = state["max_steps"]
+    tools_used: List[str] = state.get("tools_used") or []
+    oracle_used = "consult_oracle" in tools_used
 
     should_revise = decision.should_revise or reflection.get("should_revise", False)
     confidence_ok = decision.confidence >= MIN_CONFIDENCE_TO_STOP
@@ -474,13 +578,21 @@ def route_after_reflect(
         and any(p in (decision.reasoning or "").lower() for p in _INSUFFICIENT_PHRASES)
     )
 
-    if should_revise and step < max_steps:
-        logger.info("Route → reason  (should_revise=True, step=%d)", step)
-        return "reason"
-
     if step >= max_steps:
         logger.info("Route → generate_answer  (max_steps=%d reached)", max_steps)
         return "generate_answer"
+
+    # Oracle was called → stop iterating regardless of other flags
+    if oracle_used and decision.should_stop:
+        logger.info("Route → generate_answer  (oracle used + should_stop)")
+        return "generate_answer"
+    if oracle_used and not should_revise:
+        logger.info("Route → generate_answer  (oracle used, not revising)")
+        return "generate_answer"
+
+    if should_revise and step < max_steps:
+        logger.info("Route → reason  (should_revise=True, step=%d)", step)
+        return "reason"
 
     if decision.should_stop and insufficient_but_no_tool:
         logger.info("Route → reason  (rejecting stop: insufficient info, no tool used)")
@@ -495,13 +607,9 @@ def route_after_reflect(
         return "reason"
 
     if decision.should_stop and confidence_ok:
-        logger.info(
-            "Route → generate_answer  (should_stop=True, confidence=%.2f)",
-            decision.confidence,
-        )
+        logger.info("Route → generate_answer  (should_stop=True, confidence=%.2f)", decision.confidence)
         return "generate_answer"
 
-    # Default: keep iterating
     logger.info("Route → reason  (default: not ready to stop)")
     return "reason"
 
@@ -511,15 +619,6 @@ def route_after_reflect(
 # ---------------------------------------------------------------------------
 
 def build_graph(checkpointing: bool = False):
-    """
-    Build and compile the LangGraph StateGraph.
-
-    Args:
-        checkpointing: if True, attach a MemorySaver for in-process state persistence.
-
-    Returns:
-        A compiled LangGraph app ready for .invoke() / .stream().
-    """
     builder = StateGraph(AgentState)
 
     builder.add_node("reason", reason_node)
@@ -559,14 +658,20 @@ def make_initial_state(
     max_steps: int,
     tool_descriptions: str,
     retrieval_query: str = "",
+    my_company_summary: str = "",
+    company_name: str = "",
+    industry: str = "",
 ) -> AgentState:
-    """Return a clean initial AgentState."""
     return AgentState(
         task=task,
         retrieval_query=retrieval_query,
         max_steps=max_steps,
         tool_descriptions=tool_descriptions,
+        my_company_summary=my_company_summary,
+        company_name=company_name,
+        industry=industry,
         step=0,
+        tools_used=[],
         memory_items=[],
         turn_history=[],
         reason_text="",

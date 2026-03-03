@@ -14,5 +14,12 @@ sentence-transformers
 # Search (no API key)
 ddgs
 
+# Higher-intelligence oracle tool (GPT-4o-mini)
+openai
+
+# API (React webapp backend)
+fastapi
+uvicorn
+
 # Vector store: in-memory is built-in; chroma optional for persistence
 # chromadb>=0.4.0
